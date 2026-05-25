@@ -19,6 +19,8 @@ T = TypeVar("T")
 DOWNLOAD_TIMEOUT = (10, 60)
 PDF_EXTRACT_TIMEOUT = 180
 TAR_EXTRACT_TIMEOUT = 180
+BATCH_SIZE = 10
+BATCH_INTERVAL_SECONDS = 8
 
 
 def _download_file(url: str, path: str) -> None:
@@ -135,8 +137,11 @@ class ArxivRetriever(BaseRetriever):
         bar = tqdm(total=len(all_paper_ids))
         max_batch_retries = 5
         batch_retry_delay = 30
-        for i in range(0, len(all_paper_ids), 20):
-            search = arxiv.Search(id_list=all_paper_ids[i:i + 20])
+        retryable_statuses = {429, 500, 502, 503, 504}
+        for i in range(0, len(all_paper_ids), BATCH_SIZE):
+            batch_ids = all_paper_ids[i:i + BATCH_SIZE]
+            search = arxiv.Search(id_list=batch_ids)
+            batch_index = i // BATCH_SIZE
             for attempt in range(max_batch_retries):
                 try:
                     batch = list(client.results(search))
@@ -144,14 +149,22 @@ class ArxivRetriever(BaseRetriever):
                     raw_papers.extend(batch)
                     break
                 except arxiv.HTTPError as exc:
-                    if exc.status == 429 and attempt < max_batch_retries - 1:
+                    if exc.status in retryable_statuses and attempt < max_batch_retries - 1:
                         wait = batch_retry_delay * (attempt + 1)
-                        logger.warning(f"arXiv API 429 on batch {i // 20}, retry {attempt + 1}/{max_batch_retries} in {wait}s")
+                        logger.warning(
+                            f"arXiv API {exc.status} on batch {batch_index}, "
+                            f"retry {attempt + 1}/{max_batch_retries} in {wait}s"
+                        )
                         sleep(wait)
                     else:
-                        raise
-            if i + 20 < len(all_paper_ids):
-                sleep(3)
+                        logger.warning(
+                            f"Skip batch {batch_index} after {attempt + 1} attempts due to arXiv API "
+                            f"{exc.status}: {exc.url}"
+                        )
+                        bar.update(len(batch_ids))
+                        break
+            if i + BATCH_SIZE < len(all_paper_ids):
+                sleep(BATCH_INTERVAL_SECONDS)
         bar.close()
 
         return raw_papers
